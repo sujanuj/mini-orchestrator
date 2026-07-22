@@ -1,0 +1,28 @@
+services:
+  inventory-service:
+    build: ./services/inventory-service
+    container_name: inventory-service
+    ports:
+      - "8081:8080"  # host:container -- host port only for manual testing/curl
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  orders-service:
+    build: ./services/orders-service
+    container_name: orders-service
+    ports:
+      - "8080:8080"
+    environment:
+      # Container-to-container DNS: Compose resolves "inventory-service"
+      # to the inventory-service container's address on the shared
+      # default network -- this only works because both services are in
+      # this same docker-compose.yml (Compose creates one network for
+      # all services in a file by default).
+      - INVENTORY_SERVICE_URL=http://inventory-service:8080
+    depends_on:
+      inventory-service:
+        condition: service_healthy
