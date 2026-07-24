@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.sujanuj</groupId>
+  <artifactId>orchestrator</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Deliberately NOT a Spring Boot app: this is a small standalone
+         CLI tool that talks to the Docker Engine API and runs a
+         scheduled loop. Pulling in the whole Spring Framework for that
+         would be a much heavier dependency footprint than the job
+         needs; a plain JAR with a main() and a ScheduledExecutorService
+         is the actual right-sized tool here. -->
+    <docker-java.version>3.3.6</docker-java.version>
+    <snakeyaml.version>2.2</snakeyaml.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.github.docker-java</groupId>
+      <artifactId>docker-java-core</artifactId>
+      <version>${docker-java.version}</version>
+    </dependency>
+    <!-- httpclient5 transport: the actively-maintained, non-deprecated
+         transport option for docker-java as of this version. The
+         older okhttp/jersey transports are legacy in recent releases. -->
+    <dependency>
+      <groupId>com.github.docker-java</groupId>
+      <artifactId>docker-java-transport-httpclient5</artifactId>
+      <version>${docker-java.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+      <version>${snakeyaml.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>orchestrator</finalName>
+    <plugins>
+      <!-- Shade (not just package) so the resulting jar bundles
+           docker-java's and SnakeYAML's classes too: this needs to
+           run as `java -jar orchestrator.jar spec.yaml` directly on the
+           host with nothing else on the classpath, unlike the two
+           Spring Boot services which use spring-boot-maven-plugin's own
+           executable-jar repackaging instead. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <!-- Some transitive dependencies (bouncycastle, pulled in
+                   by docker-java's TLS support) ship cryptographically
+                   signed jars. Once their classes are merged into this
+                   uber-jar, those signatures no longer match the new
+                   combined manifest. The JVM correctly refuses to
+                   trust a signature that doesn't verify, which surfaces
+                   as `SecurityException: Invalid signature file digest
+                   for Manifest main attributes` at runtime, not at
+                   build time. The signature files are meaningless once
+                   repackaged regardless, so the standard fix is to
+                   strip them from the shaded jar entirely rather than
+                   try to preserve something that can't be made valid
+                   again. -->
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.sujanuj.orchestrator.Main</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
