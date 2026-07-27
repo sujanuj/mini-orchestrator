@@ -56,8 +56,38 @@ honest list of what isn't built yet — not a sanitized changelog.
 - [x] Six real bugs, found and fixed by actually running this against
       real tooling — kept in below in full, not summarized away
 
-**Phase 3 (next): health checking + auto-restart.** Not started yet. See
-**Roadmap**.
+**Phase 3: Health-aware reconciliation and auto-restart — done**
+
+- [x] Real Docker `HEALTHCHECK` status (not just "is it running") consulted
+      per container every tick via `inspectContainerCmd` -- a container
+      that's alive as a process but failing its healthcheck is now
+      detected and replaced, closing Phase 2's biggest named limitation
+- [x] Only genuinely `UNHEALTHY` containers ever get restarted;
+      `STARTING` (still within the Dockerfile's grace period) and `NONE`
+      (no healthcheck declared on the image) both count toward desired
+      replicas and are never touched based on health
+- [x] Real exponential backoff (`RestartState`) so a persistently
+      crash-looping service gets restarted immediately the first time,
+      then with growing delay, capped, rather than thrashed every 5s
+      forever
+- [x] "Restart" isn't a new, separate kind of action -- an unhealthy
+      container is stopped, and the ordinary scale-up path (which now
+      excludes it from the healthy count) naturally starts its
+      replacement, the same code path as any other scale-up
+- [x] `StopReason` (`SCALE_DOWN` / `UNHEALTHY` / `ORPHANED`) added so the
+      reconciliation log says *why* a container was stopped, not just
+      that it was
+- [x] The pure core's self-test suite grew from 8 to **22 tests, all
+      passing**, including the tricky part: backoff actually preventing
+      a repeat restart within its window, allowing one again once the
+      window passes, and resetting cleanly after recovery
+- [x] Verified live against 4 real, 3-day-old running containers: the
+      health-inspection code correctly read all of them as healthy and
+      changed nothing -- a meaningful negative result, since a subtly
+      wrong health mapping would have shown up as a storm of unwanted
+      restarts instead of quiet convergence
+
+**Phase 4 (next): rolling deploys.** Not started yet. See **Roadmap**.
 
 ---
 
@@ -594,18 +624,200 @@ instead of a GUI editor, which sidesteps this entire class of mistake.
 - **No authentication, no TLS, no rate limiting** on anything it manages
   or on the orchestrator's own operation.
 
-## Roadmap
+---
 
-**Phase 3 — health checking + auto-restart.** Consult each container's
-actual `HEALTHCHECK` status, not just "is it running." On failure,
-restart with backoff; track restart counts. This is the phase that
-turns the `503`s demonstrated in Phase 1 from a permanent failure into
-a transient one, and closes Phase 2's biggest named limitation.
+## Phase 3: health-aware reconciliation and auto-restart
+
+Phase 2's biggest named limitation was that "running" was the only
+signal the orchestrator ever consulted: a container counted as healthy
+the instant Docker reported it as `Up`, with no regard for whether the
+application inside was actually working. That's exactly the gap
+between "the process exists" and "the process is doing its job" —
+a deadlocked JVM, a connection pool that's silently exhausted, an
+infinite loop that never crashes the process, all look identical to a
+genuinely working replica if all you check is "is it running." Both
+services' Dockerfiles have declared a real `HEALTHCHECK` since Phase 1
+specifically for this reason; Phase 2 never consulted it.
+
+### Why UNHEALTHY is the only status that triggers a restart
+
+Docker reports one of three health states for a container with a
+`HEALTHCHECK` declared — `healthy`, `unhealthy`, or `starting` (still
+within the Dockerfile's `start_period`, 15s for both services here) —
+or no status at all if the image declares no `HEALTHCHECK`. Only
+`unhealthy` ever causes a restart:
+
+- **`starting`** counts toward desired replicas but is never restarted.
+  Docker's own health state machine already handles "give it time to
+  boot" via `start_period`; restarting something that hasn't even
+  finished starting would fight against its own startup instead of
+  waiting for it.
+- **No `HEALTHCHECK` declared (`NONE`)** is treated the same as
+  healthy — the orchestrator has no basis to distinguish "fine" from
+  "broken" for such a container, so it falls back to Phase 2's original
+  running-is-good behavior specifically for that container, rather than
+  guessing.
+
+### "Restart" isn't a new kind of action
+
+An unhealthy container doesn't get a special "restart" operation.
+`Reconciler` stops it, and because the very same tick's replica count is
+computed only against containers whose health *isn't* `UNHEALTHY`, that
+container no longer counts toward the desired total — so the ordinary
+scale-up logic (unchanged since Phase 2) naturally starts a replacement,
+the identical code path as any other scale-up. "Restart" is just "stop
+the bad one, let the normal deficit logic replace it," not a third kind
+of action requiring its own handling.
+
+### Why backoff exists, and how it works
+
+Without backoff, a persistently crash-looping image would get stopped
+and replaced on *every single* 5-second tick, forever — hammering the
+Docker daemon with rapid create/destroy cycles for something that's
+never going to recover on its own. `RestartState` implements the same
+idea Kubernetes' `CrashLoopBackOff` is built around: restart immediately
+the first time, then wait exponentially longer between each subsequent
+attempt for the *same* persistently-failing service, capped at 60
+seconds so an operator still sees a retry reasonably often rather than
+backoff effectively giving up. A tick where a service is fully healthy
+again resets its backoff state to fresh — a *new*, unrelated future
+failure shouldn't inherit an old incident's already-elevated delay.
+
+One deliberate, slightly subtle behavior worth naming explicitly: while
+a service's unhealthy container is still waiting out its backoff window
+(not yet stopped), the deficit calculation already excludes it from the
+healthy count — so a replacement gets started to maintain capacity
+*before* the bad container is actually cleaned up. This can briefly
+leave more containers running than `replicas` specifies (the good
+replacement plus the not-yet-stopped bad one). That's intentional:
+prefer momentarily having one extra unhealthy container over having a
+capacity deficit while replacing it.
+
+### `StopReason`: making the log say why, not just what
+
+Before this phase, every stop looked identical in the log regardless of
+cause. `StopReason` (`SCALE_DOWN`, `UNHEALTHY`, `ORPHANED`) is a small
+addition purely for operator-facing clarity — "this replica failed its
+health check" and "we simply have more replicas than desired" and "this
+service was removed from the spec entirely" are three different facts
+an operator watching the log needs to distinguish at a glance, and
+before this phase all three printed the same way.
+
+### Verified behavior (Phase 3)
+
+**The pure core, actually tested — 22/22, up from 8:**
+
+```
+$ java com.sujanuj.orchestrator.core.ReconcilerSelfTest
+PASS  scale up from zero: 3 StartContainer actions
+PASS  scale up from 1 to 3: exactly 2 StartContainer actions
+PASS  scale down from 3 to 1: stops newest+middle, keeps oldest
+PASS  already converged (2 desired, 2 running): zero actions
+PASS  two independent services converge simultaneously: 1 start (web) + 1 stop (worker)
+PASS  orphaned service (removed from spec) has all containers stopped, converged service untouched
+PASS  service explicitly desired at 0 replicas: stops all running containers
+PASS  nothing desired, nothing running: zero actions, no crash
+PASS  unhealthy container: stopped AND a replacement started
+PASS  desired=2, one healthy + one unhealthy: stop the bad one, start exactly 1 replacement (not 2 -- the healthy one still counts)
+PASS  a STARTING container counts toward desired replicas and is never restarted
+PASS  a container with no HEALTHCHECK declared (NONE) is treated as fine, matching Phase 2's original running-is-good behavior
+PASS  3 desired, 2 healthy + 1 unhealthy: only the unhealthy one is touched, healthy ones left alone
+PASS  orphan cleanup stops containers regardless of health status
+PASS  orphan cleanup also removes that service's stale restart-backoff state
+PASS  tick 1: unhealthy container stopped and replacement started
+PASS  tick 2 (1s later, within 5s backoff): the newly-unhealthy replacement is NOT stopped yet, but a replacement is still started to maintain capacity
+PASS  once the backoff window has passed, the still-unhealthy container IS stopped and the failure count increments to 2
+PASS  a fully-healthy tick resets consecutiveFailures back to 0
+PASS  a FRESH RestartState allows a restart at any time
+PASS  consecutive failures produce a growing (exponential) backoff delay
+PASS  after many consecutive failures, the backoff delay is capped (never exceeds RestartState.MAX_DELAY_MILLIS)
+
+22 passed, 0 failed
+```
+
+The 14 Phase 2 tests are unchanged and still pass via the original
+2-argument `reconcile()` overload — deliberate regression proof that
+becoming health-aware didn't alter Phase 2's original behavior for the
+everything-is-healthy case. The 8 new tests specifically exercise the
+trickiest part of this phase: backoff correctly preventing a repeat
+restart within its window (tick 2 in the log above), allowing one again
+once the window passes, and resetting cleanly after recovery — verified
+with simulated timestamps, not a real clock or `Thread.sleep()`
+anywhere in the test suite.
+
+**The live run, against real, pre-existing, 3-day-old containers:**
+
+```
+mini-orchestrator: connecting to Docker daemon...
+mini-orchestrator: watching spec.example.yaml, reconciling every 5s
+[22:05:09] converged, no action needed
+[22:05:14] converged, no action needed
+[22:05:19] converged, no action needed
+```
+
+Confirmed independently against the same containers:
+
+```bash
+$ docker ps --filter "label=mini-orchestrator.managed=true"
+CONTAINER ID   IMAGE                                        STATUS                CREATED
+c595ef3c046f   mini-orchestrator-inventory-service:latest   Up 3 days (healthy)   3 days ago
+fa3d04899cca   mini-orchestrator-inventory-service:latest   Up 3 days (healthy)   3 days ago
+425baa4ea773   mini-orchestrator-inventory-service:latest   Up 3 days (healthy)   3 days ago
+0b9281aadf48   mini-orchestrator-orders-service:latest      Up 3 days (healthy)   3 days ago
+```
+
+This "nothing happened" result is more informative than it looks: the
+new `inspectContainerCmd`-based health-reading code had to correctly
+classify all 4 real containers as healthy for the orchestrator to stay
+quiet. If the health-status mapping were subtly wrong — say, misreading
+Docker's `"healthy"` string as `UNHEALTHY` — the visible result would
+have been a storm of unwanted stop/replace actions on the very first
+tick, not silence. Quiet convergence against genuinely healthy
+containers is a real (if undramatic) confirmation the mapping works.
+
+### Known limitations (Phase 3)
+
+- **An extra Docker API call per managed container, every tick.**
+  `listContainersCmd()` alone doesn't expose structured health data —
+  only `inspectContainerCmd(id)` does. `listManagedContainers()` now
+  makes one list call plus one inspect call per managed container, every
+  5 seconds. Trivially cheap for the handful of containers a local demo
+  manages; would need batching or caching to stay cheap at real scale
+  with hundreds of managed containers — a deliberate simplification for
+  this project's scope, not an oversight.
+- **No distinction between different causes of "unhealthy."** A
+  container that's unhealthy because of a transient blip and one that's
+  unhealthy because the image is fundamentally broken are treated
+  identically — both get restarted on the same backoff schedule. A real
+  system might want different handling (e.g. giving up entirely after N
+  consecutive failures, rather than backing off indefinitely).
+- **Restart counts aren't exposed anywhere outside the log.** They exist
+  in `RestartState` and are used for backoff timing, but there's no
+  `status` command or API to query "how many times has this service
+  restarted" — only scrollback through the log. Phase 5's planned CLI is
+  the natural place to surface this.
+- **A replacement container isn't verified as actually healthy before
+  the incident is considered resolved.** Once a bad container is
+  stopped and a replacement started, the orchestrator moves on; if the
+  replacement *also* comes up unhealthy, that's caught on a later tick
+  (as an ordinary new failure, subject to backoff) rather than treated
+  as a continuation of the same incident with any special handling.
+- **The backoff policy (base delay, cap, growth rate) is a single global
+  constant, not configurable per service.** A service known to be
+  flaky and a service that should almost never fail currently get
+  identical backoff behavior.
+
+---
+
+## Roadmap
 
 **Phase 4 — rolling deploys.** Deploy a new image version with
 zero-downtime replacement: start the new container, wait for it to pass
 health checks, only then stop the old one. The headline demo: `docker
 kill` a container mid-traffic and watch the system self-heal live.
+Builds directly on Phase 3's health-checking: a rolling deploy needs the
+exact same "wait for the new one to actually pass its HEALTHCHECK before
+touching the old one" logic already proven there.
 
 **Phase 5 — a CLI** (`apply`, `status`, `scale`, `rollback`) against this
 project's own spec format.
@@ -690,7 +902,11 @@ mini-orchestrator/
         ├── core/              <- pure, dependency-free reconciliation logic
         │   ├── ServiceSpec.java
         │   ├── ManagedContainer.java
+        │   ├── HealthStatus.java      <- Phase 3
         │   ├── ReconcileAction.java
+        │   ├── StopReason.java         <- Phase 3
+        │   ├── ReconcileResult.java     <- Phase 3
+        │   ├── RestartState.java         <- Phase 3
         │   ├── Reconciler.java
         │   └── ReconcilerSelfTest.java
         ├── docker/             <- docker-java integration (Docker Engine API)
