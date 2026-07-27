@@ -11,10 +11,17 @@ package com.sujanuj.orchestrator.core;
  * has more replicas than desired -- see Reconciler's scale-down
  * comment for why "stop the newest first" was chosen over the
  * alternative.
+ *
+ * health (added Phase 3) is what lets Reconciler distinguish a
+ * genuinely working replica from one that's merely still running as a
+ * process -- see HealthStatus for what each value means and why only
+ * UNHEALTHY triggers a restart.
  */
 public record ManagedContainer(
         String containerId,
         String serviceName,
-        long startedAtEpochMillis
+        long startedAtEpochMillis,
+        HealthStatus health
 ) {
 }
+

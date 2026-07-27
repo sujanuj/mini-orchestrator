@@ -7,6 +7,7 @@ import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Network;
 import com.github.dockerjava.api.model.PortBinding;
+import com.sujanuj.orchestrator.core.HealthStatus;
 import com.sujanuj.orchestrator.core.ManagedContainer;
 import com.sujanuj.orchestrator.core.ReconcileAction;
 import com.sujanuj.orchestrator.core.ServiceSpec;
@@ -88,11 +89,17 @@ public final class DockerActuator {
     /**
      * Lists every currently-RUNNING container this orchestrator manages
      * (carries LABEL_MANAGED=true), grouped by the service name recorded
-     * on LABEL_SERVICE. Only running containers are returned -- an
-     * exited or crashed container doesn't count toward a service's
-     * observed replica count for Reconciler's purposes; making that
-     * distinction visible is exactly Phase 3's job (health/restart), not
-     * Phase 2's.
+     * on LABEL_SERVICE -- now including each one's real Docker health
+     * status (Phase 3), not just the fact that it's running.
+     *
+     * Cost, named honestly: `listContainersCmd()` alone doesn't expose
+     * structured health data -- only `inspectContainerCmd(id)` does. This
+     * method therefore makes ONE list call plus one ADDITIONAL inspect
+     * call per managed container, every single reconciliation tick. For
+     * the handful of containers a local demo manages, this is trivially
+     * cheap; it would NOT scale to hundreds of managed containers polled
+     * every 5 seconds without batching or caching -- a real, deliberate
+     * simplification for this project's scope, not an oversight.
      */
     public Map<String, List<ManagedContainer>> listManagedContainers() {
         List<Container> containers = client.listContainersCmd()
@@ -123,10 +130,38 @@ public final class DockerActuator {
             // created long before being started, which never happens
             // here.
             long startedAtMillis = c.getCreated() == null ? 0L : c.getCreated() * 1000L;
+            HealthStatus health = inspectHealth(c.getId());
             result.computeIfAbsent(serviceName, k -> new ArrayList<>())
-                    .add(new ManagedContainer(c.getId(), serviceName, startedAtMillis));
+                    .add(new ManagedContainer(c.getId(), serviceName, startedAtMillis, health));
         }
         return result;
+    }
+
+    /**
+     * Queries a single container's real Docker health status. A null
+     * Health object means the image has no HEALTHCHECK declared at all
+     * (maps to HealthStatus.NONE) -- both this project's own Dockerfiles
+     * DO declare one, so in practice this only matters for images
+     * outside this project's control.
+     */
+    private HealthStatus inspectHealth(String containerId) {
+        var inspection = client.inspectContainerCmd(containerId).exec();
+        var health = inspection.getState() == null ? null : inspection.getState().getHealth();
+        if (health == null || health.getStatus() == null) {
+            return HealthStatus.NONE;
+        }
+        return switch (health.getStatus()) {
+            case "healthy" -> HealthStatus.HEALTHY;
+            case "unhealthy" -> HealthStatus.UNHEALTHY;
+            case "starting" -> HealthStatus.STARTING;
+            // An unrecognized status string from a future Docker version
+            // is treated as NONE (i.e. "don't act on health for this
+            // container") rather than guessed at -- silently assuming a
+            // meaning for a string this code doesn't recognize is worse
+            // than falling back to Phase 2's original running-is-good
+            // behavior for it.
+            default -> HealthStatus.NONE;
+        };
     }
 
     public void apply(ReconcileAction action) {

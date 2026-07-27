@@ -22,6 +22,9 @@ public sealed interface ReconcileAction {
      * service that used to be in the spec and no longer is -- see
      * Reconciler) has no ServiceSpec left to reference at all, only the
      * name recorded on the now-orphaned container's label.
+     *
+     * reason (added Phase 3) exists purely so the reconciliation log can
+     * say WHY, not just WHAT -- see StopReason.
      */
-    record StopContainer(String containerId, String serviceName) implements ReconcileAction {}
+    record StopContainer(String containerId, String serviceName, StopReason reason) implements ReconcileAction {}
 }

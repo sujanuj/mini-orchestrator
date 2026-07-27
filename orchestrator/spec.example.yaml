@@ -4,40 +4,20 @@
 # machine with `docker images | grep mini-orchestrator` before running
 # this, since Compose derives image names from the parent directory
 # name, which can vary.
-#
-# Try this as your first demo: start with inventory-service at
-# replicas: 1, run the orchestrator, confirm one container comes up
-# (`docker ps --filter label=mini-orchestrator.managed=true`), then edit
-# this file to replicas: 3 and save -- no restart needed, the next
-# reconciliation tick (within 5s) should start two more.
 
 services:
+  - name: inventory-service
+    image: mini-orchestrator-inventory-service:latest
+    replicas: 3
+    containerPort: 8080
+    healthPath: /health
+    env: {}
 
   - name: orders-service
     image: mini-orchestrator-orders-service:latest
     replicas: 1
     containerPort: 8080
-    # Different from Phase 1's own host port (8080) specifically so this
-    # can run ALONGSIDE the docker-compose baseline without a port
-    # collision, if both happen to be up at the same time.
     hostPort: 8090
     healthPath: /health
     env:
-      # Container DNS on the orchestrator's own network
-      # (mini-orchestrator-net) -- NOT the docker-compose network from
-      # Phase 1, which is a separate, unrelated network. This only
-      # resolves if inventory-service above is ALSO running as an
-      # orchestrator-managed container, not the docker-compose one.
       INVENTORY_SERVICE_URL: http://inventory-service:8080
-
-# IMPORTANT if you scale orders-service above replicas: 1 -- remove
-# hostPort first. Two containers can't both bind host port 8090; Docker
-# will fail the second container's start with a clear "port already
-# allocated" error rather than silently doing something wrong, but it's
-# simpler to just not publish a fixed host port for any service you
-# intend to run with more than one replica. Reach a multi-replica
-# service via its container-network name instead (e.g. from another
-# orchestrator-managed container, or `docker exec` into one to curl the
-# others) -- there's no load-balancer/ingress layer in front of multiple
-# replicas yet; that's real, unbuilt future work, not something Phase 2
-# claims to solve.

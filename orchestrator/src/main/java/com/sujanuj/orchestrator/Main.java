@@ -6,8 +6,11 @@ import com.github.dockerjava.core.DockerClientConfig;
 import com.github.dockerjava.core.DockerClientImpl;
 import com.github.dockerjava.httpclient5.ApacheDockerHttpClient;
 import com.github.dockerjava.transport.DockerHttpClient;
+import com.sujanuj.orchestrator.core.ManagedContainer;
 import com.sujanuj.orchestrator.core.ReconcileAction;
+import com.sujanuj.orchestrator.core.ReconcileResult;
 import com.sujanuj.orchestrator.core.Reconciler;
+import com.sujanuj.orchestrator.core.RestartState;
 import com.sujanuj.orchestrator.core.ServiceSpec;
 import com.sujanuj.orchestrator.docker.DockerActuator;
 import com.sujanuj.orchestrator.spec.SpecLoader;
@@ -18,6 +21,7 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Entry point: `java -jar orchestrator.jar path/to/spec.yaml`.
@@ -31,6 +35,14 @@ import java.util.concurrent.TimeUnit;
  * watching the file for changes with a filesystem watcher) would either
  * lose the live-editing demo or add real complexity for a marginal
  * efficiency gain that doesn't matter at this scale.
+ *
+ * Since Phase 3, this also carries per-service restart-backoff state
+ * (RestartState) across ticks in an AtomicReference. A plain field
+ * would technically be fine too -- scheduleAtFixedRate on a
+ * single-thread executor guarantees reconcileOnce() never runs
+ * concurrently with itself -- but AtomicReference makes the intended
+ * memory-visibility guarantee explicit rather than relying on an
+ * unstated assumption about the executor's threading model.
  */
 public final class Main {
 
@@ -45,6 +57,7 @@ public final class Main {
 
         DockerClient client = buildDockerClient();
         DockerActuator actuator = new DockerActuator(client);
+        AtomicReference<Map<String, RestartState>> restartState = new AtomicReference<>(Map.of());
 
         System.out.println("mini-orchestrator: connecting to Docker daemon...");
         actuator.ensureNetworkExists();
@@ -53,7 +66,7 @@ public final class Main {
 
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(
-                () -> reconcileOnce(specPath, actuator),
+                () -> reconcileOnce(specPath, actuator, restartState),
                 0, RECONCILE_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -102,21 +115,23 @@ public final class Main {
      * (e.g. caught mid-save by a text editor) would defeat its own
      * purpose.
      */
-    private static void reconcileOnce(String specPath, DockerActuator actuator) {
+    private static void reconcileOnce(
+            String specPath, DockerActuator actuator, AtomicReference<Map<String, RestartState>> restartState) {
         String timestamp = LocalTime.now().withNano(0).toString();
         try {
             List<ServiceSpec> desired = SpecLoader.load(specPath);
-            Map<String, List<com.sujanuj.orchestrator.core.ManagedContainer>> actual =
-                    actuator.listManagedContainers();
+            Map<String, List<ManagedContainer>> actual = actuator.listManagedContainers();
 
-            List<ReconcileAction> actions = Reconciler.reconcile(desired, actual);
+            ReconcileResult result = Reconciler.reconcile(
+                    desired, actual, restartState.get(), System.currentTimeMillis());
+            restartState.set(result.restartState());
 
-            if (actions.isEmpty()) {
+            if (result.actions().isEmpty()) {
                 System.out.println("[" + timestamp + "] converged, no action needed");
                 return;
             }
 
-            for (ReconcileAction action : actions) {
+            for (ReconcileAction action : result.actions()) {
                 logAction(timestamp, action);
                 actuator.apply(action);
             }
@@ -134,7 +149,8 @@ public final class Main {
                             + start.spec().name() + "' (" + start.spec().image() + ")");
             case ReconcileAction.StopContainer stop ->
                     System.out.println("[" + timestamp + "] stopping '" + stop.serviceName()
-                            + "' replica " + stop.containerId().substring(0, Math.min(12, stop.containerId().length())));
+                            + "' replica " + stop.containerId().substring(0, Math.min(12, stop.containerId().length()))
+                            + " (reason: " + stop.reason() + ")");
         }
     }
 }
