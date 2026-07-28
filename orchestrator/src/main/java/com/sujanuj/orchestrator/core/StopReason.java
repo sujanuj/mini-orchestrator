@@ -18,6 +18,12 @@ public enum StopReason {
      * replaced -- see Reconciler and RestartState. */
     UNHEALTHY,
 
+    /** This container is running an OLD image; the spec now wants a
+     * different one, and a healthy replacement on the new image has
+     * already been confirmed ready -- see Reconciler's rolling-deploy
+     * logic (Phase 4). */
+    ROLLING_DEPLOY,
+
     /** This service no longer appears in the desired spec at all. */
     ORPHANED
 }

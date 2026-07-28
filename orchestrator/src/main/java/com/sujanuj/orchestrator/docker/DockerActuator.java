@@ -51,6 +51,15 @@ public final class DockerActuator {
     public static final String LABEL_MANAGED = "mini-orchestrator.managed";
     public static final String LABEL_SERVICE = "mini-orchestrator.service";
 
+    /** Records exactly which image a container was actually started
+     * from, set at creation time -- this is what makes rolling-deploy
+     * detection possible at all (Phase 4). Read back by
+     * listManagedContainers() into ManagedContainer.image(). A
+     * container from before this label existed simply won't have it;
+     * see ManagedContainer and Reconciler for why that's treated as
+     * "current," not "stale." */
+    public static final String LABEL_IMAGE = "mini-orchestrator.image";
+
     private static final String NETWORK_NAME = "mini-orchestrator-net";
     private static final int STOP_TIMEOUT_SECONDS = 10;
 
@@ -131,8 +140,13 @@ public final class DockerActuator {
             // here.
             long startedAtMillis = c.getCreated() == null ? 0L : c.getCreated() * 1000L;
             HealthStatus health = inspectHealth(c.getId());
+            // Absent for any container started before this label
+            // existed -- ManagedContainer(image=null) intentionally,
+            // not a made-up fallback string. See ManagedContainer and
+            // Reconciler for why null is treated as "current."
+            String image = c.getLabels().get(LABEL_IMAGE);
             result.computeIfAbsent(serviceName, k -> new ArrayList<>())
-                    .add(new ManagedContainer(c.getId(), serviceName, startedAtMillis, health));
+                    .add(new ManagedContainer(c.getId(), serviceName, startedAtMillis, health, image));
         }
         return result;
     }
@@ -177,6 +191,7 @@ public final class DockerActuator {
         Map<String, String> labels = new LinkedHashMap<>();
         labels.put(LABEL_MANAGED, "true");
         labels.put(LABEL_SERVICE, spec.name());
+        labels.put(LABEL_IMAGE, spec.image());
 
         List<String> envList = spec.env().entrySet().stream()
                 .map(e -> e.getKey() + "=" + e.getValue())

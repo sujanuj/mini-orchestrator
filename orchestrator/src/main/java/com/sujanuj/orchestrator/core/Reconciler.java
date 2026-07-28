@@ -30,6 +30,17 @@ import java.util.Map;
  * (which now counts only non-UNHEALTHY containers) naturally start its
  * replacement, subject to exponential backoff so a persistently
  * crash-looping image doesn't get thrashed every single tick.
+ *
+ * Image-aware since Phase 4: every observed container's own image is
+ * compared against the spec's currently-desired image. A container on
+ * an OLD image is never mistaken for a healthy current replica, no
+ * matter how healthy IT is -- it's tracked separately as "stale" and
+ * retired via a paced rolling replacement (see the per-service loop
+ * below), not by the ordinary scale-down path. Health-awareness and
+ * image-awareness compose: Phase 3's unhealthy/backoff logic runs only
+ * within the current-image group, since a stale container's health is
+ * irrelevant -- it's leaving regardless of whether its healthcheck
+ * currently passes.
  */
 public final class Reconciler {
 
@@ -66,17 +77,33 @@ public final class Reconciler {
         Map<String, RestartState> updatedRestartState = new HashMap<>(restartState);
 
         // --- Part 1: for every DESIRED service, converge its replica count,
-        // now health-aware. ---
+        // health-aware AND image-aware. ---
         for (ServiceSpec spec : desired) {
             List<ManagedContainer> running = actualByName.getOrDefault(spec.name(), List.of());
 
-            List<ManagedContainer> unhealthy = running.stream()
+            // Partition by image identity first. A null image (no label --
+            // a container started by a pre-Phase-4 orchestrator, before
+            // this label existed) is deliberately treated as "current,"
+            // not "stale": defaulting an unlabeled legacy container to
+            // "must be replaced" would force a surprise rolling
+            // replacement of every existing container the very first time
+            // this version of the orchestrator runs against them, which
+            // is a worse default than simply not knowing.
+            List<ManagedContainer> currentImage = running.stream()
+                    .filter(c -> c.image() == null || c.image().equals(spec.image()))
+                    .toList();
+            List<ManagedContainer> staleImage = running.stream()
+                    .filter(c -> c.image() != null && !c.image().equals(spec.image()))
+                    .toList();
+
+            // --- Health/backoff (Phase 3), operating ONLY on the
+            // current-image group. A stale container's health is
+            // irrelevant to this decision -- it's being retired below
+            // regardless of whether its healthcheck currently passes. ---
+            List<ManagedContainer> unhealthy = currentImage.stream()
                     .filter(c -> c.health() == HealthStatus.UNHEALTHY)
                     .toList();
-            // HEALTHY, STARTING, and NONE all count as "good enough" --
-            // see HealthStatus for why STARTING and NONE aren't treated
-            // as failures.
-            List<ManagedContainer> healthyEnough = running.stream()
+            List<ManagedContainer> healthyEnough = currentImage.stream()
                     .filter(c -> c.health() != HealthStatus.UNHEALTHY)
                     .toList();
 
@@ -84,40 +111,13 @@ public final class Reconciler {
 
             if (!unhealthy.isEmpty()) {
                 if (state.canRestartNow(nowEpochMillis)) {
-                    // Stop every currently-unhealthy container for this
-                    // service. Deliberately NOT emitting a StartContainer
-                    // here directly -- the deficit calculation just below
-                    // (against healthyEnough.size(), which already
-                    // excludes these) naturally emits exactly the right
-                    // number of replacements, the same code path as an
-                    // ordinary scale-up. Restarting an unhealthy
-                    // container is just "stop the bad one, let the
-                    // normal deficit logic replace it" -- not a
-                    // special-cased third kind of action.
                     for (ManagedContainer bad : unhealthy) {
                         actions.add(new ReconcileAction.StopContainer(
                                 bad.containerId(), spec.name(), StopReason.UNHEALTHY));
                     }
                     updatedRestartState.put(spec.name(), state.afterRestart(nowEpochMillis));
                 }
-                // else: still within backoff for this service -- leave
-                // the unhealthy container(s) running for now rather than
-                // thrashing. They're already excluded from
-                // healthyEnough, so the deficit logic below still starts
-                // replacements to maintain desired capacity even while
-                // the bad one sits there awaiting cleanup on a later
-                // tick. This can briefly leave MORE containers running
-                // than `replicas` (the good replacements plus the
-                // not-yet-stopped bad one) -- a deliberate choice:
-                // prefer momentarily having one extra unhealthy
-                // container over having a capacity deficit while
-                // replacing it.
             } else if (state.consecutiveFailures() > 0) {
-                // No unhealthy containers this tick, and this service HAD
-                // a failure history -- it's recovered. Reset backoff so a
-                // FUTURE failure (a new, unrelated incident) is treated
-                // as a fresh first failure, not as a continuation of an
-                // old one that already healed.
                 updatedRestartState.put(spec.name(), RestartState.FRESH);
             }
 
@@ -127,13 +127,14 @@ public final class Reconciler {
                 for (int i = 0; i < deficit; i++) {
                     actions.add(new ReconcileAction.StartContainer(spec));
                 }
-            } else if (deficit < 0) {
-                // Over-replicated: stop (-deficit) of the currently
-                // healthy-enough containers, newest-first -- see the
-                // original Phase 2 reasoning, unchanged: a just-started
-                // container has had the least chance to do useful work
-                // and is least likely to be mid-request under any future
-                // load-balancing.
+            } else if (deficit < 0 && staleImage.isEmpty()) {
+                // Ordinary over-replicated scale-down, newest-first --
+                // unchanged from Phase 2/3. Deliberately gated on
+                // staleImage being empty: mid-rollout, currentImage
+                // legitimately exceeding `replicas` is expected and
+                // temporary (new replicas surging in while old ones are
+                // still being retired below), not something to correct
+                // by removing brand-new replacements.
                 List<ManagedContainer> sortedNewestFirst = new ArrayList<>(healthyEnough);
                 sortedNewestFirst.sort(
                         Comparator.comparingLong(ManagedContainer::startedAtEpochMillis).reversed());
@@ -145,13 +146,44 @@ public final class Reconciler {
                             victim.containerId(), spec.name(), StopReason.SCALE_DOWN));
                 }
             }
+
+            // --- Rolling retirement of stale-image containers (Phase 4).
+            // Paced at ONE retirement per tick, and only once at least one
+            // CURRENT-image replacement is CONFIRMED healthy -- not merely
+            // STARTING. This is the entire point of a rolling deploy being
+            // zero-downtime: retiring an old, working replica the instant
+            // a replacement merely begins starting (before its healthcheck
+            // has actually passed) could momentarily leave less healthy
+            // capacity than before the deploy began, which defeats the
+            // purpose. STARTING counting as "good enough" for ordinary
+            // scale-up (above) and STARTING NOT counting as "ready to
+            // retire the old one for" here are deliberately different
+            // bars for deliberately different decisions. ---
+            if (!staleImage.isEmpty()) {
+                boolean hasConfirmedHealthyReplacement = currentImage.stream()
+                        .anyMatch(c -> c.health() == HealthStatus.HEALTHY || c.health() == HealthStatus.NONE);
+                if (hasConfirmedHealthyReplacement) {
+                    List<ManagedContainer> sortedStaleOldestFirst = new ArrayList<>(staleImage);
+                    sortedStaleOldestFirst.sort(
+                            Comparator.comparingLong(ManagedContainer::startedAtEpochMillis));
+                    ManagedContainer retiring = sortedStaleOldestFirst.get(0);
+                    actions.add(new ReconcileAction.StopContainer(
+                            retiring.containerId(), spec.name(), StopReason.ROLLING_DEPLOY));
+                }
+                // else: no confirmed-healthy replacement exists yet --
+                // retire nothing this tick. The deficit branch above will
+                // have already started new-image replicas if needed; wait
+                // for one of them to pass health before touching anything
+                // still serving on the old image.
+            }
         }
 
-        // --- Part 2: orphan cleanup -- unchanged from Phase 2. Every
-        // container (healthy or not) for a service no longer in the
-        // desired spec gets stopped, regardless of backoff state --
-        // backoff only paces restarts of services we still want running;
-        // a removed service should be cleaned up immediately. ---
+        // --- Part 2: orphan cleanup -- unchanged from Phase 2/3. Every
+        // container (healthy or not, current-image or stale) for a
+        // service no longer in the desired spec gets stopped, regardless
+        // of backoff state -- backoff only paces restarts of services we
+        // still want running; a removed service should be cleaned up
+        // immediately. ---
         for (Map.Entry<String, List<ManagedContainer>> entry : actualByName.entrySet()) {
             String serviceName = entry.getKey();
             boolean stillDesired = desired.stream().anyMatch(s -> s.name().equals(serviceName));
@@ -170,10 +202,11 @@ public final class Reconciler {
 
     /**
      * Convenience overload for callers (and tests) that don't care about
-     * health/backoff -- treats every observed container as healthy and
-     * ignores restart state. This is exactly Phase 2's original
-     * behavior, preserved so pure scale-up/scale-down/orphan-cleanup
-     * logic can still be tested in isolation from health-awareness.
+     * health/backoff/image-tracking -- treats every observed container
+     * as healthy and on the current image, and ignores restart state.
+     * This is exactly Phase 2's original behavior, preserved so pure
+     * scale-up/scale-down/orphan-cleanup logic can still be tested in
+     * isolation.
      */
     public static List<ReconcileAction> reconcile(
             List<ServiceSpec> desired, Map<String, List<ManagedContainer>> actualByName) {
