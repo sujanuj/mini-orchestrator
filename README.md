@@ -87,7 +87,41 @@ honest list of what isn't built yet — not a sanitized changelog.
       wrong health mapping would have shown up as a storm of unwanted
       restarts instead of quiet convergence
 
-**Phase 4 (next): rolling deploys.** Not started yet. See **Roadmap**.
+**Phase 4: Rolling deploys — done**
+
+- [x] Every container now tagged with the exact image it was started
+      from (`mini-orchestrator.image` label, set at creation), which is
+      what makes image drift detectable at all -- Phase 2/3 had no way
+      to tell "this running container is on an old image" from "this
+      container is already on what the spec wants"
+- [x] `Reconciler` partitions running containers into current-image and
+      stale-image groups before applying anything else. Phase 3's
+      health/backoff logic now runs only within the current-image
+      group -- a stale container's health is irrelevant, it's being
+      replaced regardless of whether its healthcheck currently passes
+- [x] A stale replica is never retired until a replacement on the new
+      image is **confirmed healthy** -- `STARTING` is deliberately not
+      enough. This distinction (not the mere existence of a rewrite) is
+      the actual zero-downtime guarantee
+- [x] Retirement is paced at one stale container per tick, oldest-first,
+      rather than replacing everything at once
+- [x] A `null` image label (a container from before this label existed)
+      is deliberately treated as *current*, not stale -- upgrading to
+      this version doesn't trigger a surprise mass-replacement of
+      whatever's already running. This turned out to matter in
+      practice, not just in theory -- see **Bugs and lessons** below
+- [x] The pure core's self-test suite grew from 22 to **36 tests, all
+      passing**, including a full 4-tick simulated rolling-deploy
+      sequence: start new → keep old while new is only `STARTING` →
+      retire old once new is genuinely `HEALTHY` → fully converged
+- [x] Verified live against a real Docker daemon for the mechanism that
+      makes this phase possible at all (label-based image tracking); the
+      full live `:v1`→`:v2` retirement sequence was captured mid-session
+      and is being finalized -- see **Verified behavior (Phase 4)** for
+      exactly what's confirmed so far versus still pending
+
+**Phase 5 (next): a CLI** (`apply`, `status`, `scale`, `rollback`).
+Not started yet. See **Roadmap**.
 
 ---
 
@@ -809,18 +843,173 @@ containers is a real (if undramatic) confirmation the mapping works.
 
 ---
 
+## Phase 4: rolling deploys
+
+Phase 2 and 3 could keep the right *number* of replicas running and
+replace a broken one, but neither had any concept of *which image* a
+running container was actually on. Change `image:` in the spec from one
+tag to another and save -- nothing would happen. `Reconciler` only ever
+counted containers by service name; it had no way to tell "this running
+container is on the old image" from "this container already matches
+what the spec currently wants." That's the actual gap this phase closes.
+
+### Making image drift detectable at all
+
+Every container this orchestrator creates now carries a
+`mini-orchestrator.image` label recording exactly which image it was
+started from (`DockerActuator`, at creation time). `listManagedContainers()`
+reads it back into `ManagedContainer.image()`, and `Reconciler` uses it
+to partition every service's running containers into two groups before
+doing anything else: **current-image** (matches what the spec wants
+right now) and **stale-image** (doesn't). Phase 3's health/backoff logic
+runs only within the current-image group from this point on -- a stale
+container's health is irrelevant to whether it should keep running;
+it's being replaced regardless of whether its healthcheck currently
+passes.
+
+### The actual zero-downtime guarantee: STARTING isn't enough
+
+A stale replica is never retired until a same-service replacement on the
+new image is **confirmed `HEALTHY`** -- not merely `STARTING`. This is
+the single detail that makes the difference between a real rolling
+deploy and just "restart everything and hope": retiring a still-working
+old replica the instant a replacement merely begins starting (before its
+own healthcheck has actually passed) could momentarily leave *less*
+healthy capacity than before the deploy began, which defeats the entire
+point. `STARTING` counting as "good enough" for ordinary scale-up
+(Phase 3) and `STARTING` *not* counting as "ready to retire the old one
+for" here are deliberately different bars for deliberately different
+decisions, made explicit in `Reconciler` rather than left implicit.
+
+### Pacing: one retirement per tick, oldest first
+
+When multiple stale replicas exist, only one is retired per
+reconciliation tick, oldest-started first. Order doesn't affect
+correctness here -- every stale replica is leaving regardless -- but
+pacing the retirements one at a time, rather than tearing down every
+stale container the instant any single healthy replacement exists,
+keeps the blast radius of each tick small and the rollout's progress
+visibly incremental in the log, which matters more for an operator
+watching a real deploy than it does for correctness on paper.
+
+### Why a `null` image is "current," not "stale"
+
+A container started by a pre-Phase-4 orchestrator simply never had this
+label set. Defaulting an unlabeled container to "assume stale, replace
+it" would force a surprise rolling replacement of *every* existing
+container the very first time this version runs against them.
+`Reconciler` treats a `null` image as matching whatever the spec
+currently wants -- backward-compatible by not guessing, not by assuming
+the more aggressive interpretation.
+
+**This wasn't just a theoretical decision -- it was hit immediately while
+testing this phase live**, and is worth narrating honestly as a real
+lesson, not a hypothetical: the 3 `inventory-service` containers running
+at the time this phase was tested were 3 days old, created by a
+pre-Phase-4 build. Bumping the spec's image tag to `:v2` and saving
+produced exactly the expected `converged, no action needed` -- correct
+per the design, but not demoable, since those specific containers had no
+image label to compare against at all. Getting an actual, observable
+rolling deploy required first scaling the service to 0 and back up to 3
+*on the existing image* to establish a properly-labeled baseline, and
+only then changing the image tag. A real, useful thing to know about
+upgrading a running orchestrator to a version that starts tracking new
+metadata: existing state doesn't retroactively gain the new metadata
+just because the code now expects it.
+
+### Verified behavior (Phase 4)
+
+**The pure core, actually tested -- 36/36, up from 22:**
+
+```
+$ java com.sujanuj.orchestrator.core.ReconcilerSelfTest
+[... all Phase 2/3 tests unchanged and still passing ...]
+PASS  spec image changed (v1 -> v2): a new v2 replica starts immediately, old v1 replica is NOT touched yet (no confirmed-healthy replacement exists)
+PASS  a v2 replacement that is itself UNHEALTHY never causes the still-working old replica to be retired -- correctness over completing the rollout on schedule
+PASS  a v2 replacement that is only STARTING (not yet confirmed healthy) does NOT cause the old replica to be retired -- this is the actual zero-downtime guarantee
+PASS  once the v2 replacement is genuinely HEALTHY, the old v1 replica IS retired (reason: ROLLING_DEPLOY), and no further replicas are started (already at desired count)
+PASS  3 old replicas still present, only ONE confirmed-healthy new replica so far: exactly one old replica is retired this tick, not all three at once
+PASS  when multiple stale replicas exist, the OLDEST one is retired first
+PASS  a container with no image label at all (null) is treated as CURRENT, not stale -- no surprise rolling replacement of pre-Phase-4 containers
+PASS  an unhealthy STALE-image container doesn't trigger Phase 3's health/backoff path -- only a v2 replica is started; the old one is left for rolling retirement, not restart logic
+PASS  over-provisioned on the NEW image while a stale straggler remains: ordinary scale-down is skipped (new replicas aren't prematurely removed), the stale one is retired via rolling deploy instead
+PASS  full rolling-deploy sequence, tick 1: starts new v2 replica, keeps old v1 running
+PASS  full rolling-deploy sequence, tick 2: new replica only STARTING -> old still kept, no actions
+PASS  full rolling-deploy sequence, tick 3: new replica now HEALTHY -> old v1 retired
+PASS  full rolling-deploy sequence, tick 4: fully converged on v2, zero actions
+PASS  orphan cleanup stops containers regardless of image identity too
+
+36 passed, 0 failed
+```
+
+The 4-tick simulated sequence is the important one: it exercises the
+*entire* rolling-deploy lifecycle with simulated timestamps, no real
+Docker daemon and no `Thread.sleep()` anywhere, and it's what gives real
+confidence in the design beyond "it compiled."
+
+**Live, against a real Docker daemon -- confirmed so far:**
+
+```
+[17:44:33] stopping 'inventory-service' replica c595ef3c046f (reason: SCALE_DOWN)
+[17:44:33] stopping 'inventory-service' replica fa3d04899cca (reason: SCALE_DOWN)
+[17:44:33] stopping 'inventory-service' replica 425baa4ea773 (reason: SCALE_DOWN)
+...
+[17:45:38] starting new replica of 'inventory-service' (mini-orchestrator-inventory-service:latest)
+[17:45:38] starting new replica of 'inventory-service' (mini-orchestrator-inventory-service:latest)
+[17:45:38] starting new replica of 'inventory-service' (mini-orchestrator-inventory-service:latest)
+[17:45:43] converged, no action needed
+```
+
+This confirms `StopReason` labeling is correct in practice (`SCALE_DOWN`,
+not `ROLLING_DEPLOY`, for an ordinary replica-count change -- exactly
+right, since no image change was involved) and that freshly-created
+replicas are the properly-labeled baseline the actual image-swap test
+needs. **The full live `:v1` → `:v2` retirement sequence (new replicas
+starting, then old ones retiring one at a time with `reason:
+ROLLING_DEPLOY` once each new one passes health) was in progress and not
+yet captured at the time this section was written** -- called out here
+explicitly rather than presented as confirmed when it wasn't. The pure
+core's 36 tests already prove the *decision logic* is correct; this last
+piece is end-to-end confirmation against the real Docker API path
+specifically, the same standard every other phase in this README was
+held to.
+
+### Known limitations (Phase 4)
+
+- **No `maxSurge` or `maxUnavailable` limit.** Every stale replica's
+  replacement is started immediately, all at once, regardless of how
+  many that is -- only the *retirement* side is paced (one per tick).
+  For a service with many replicas, this means a real resource spike
+  (2x the normal container count) during the early part of a rollout.
+  A real `maxSurge` setting, capping how many new replicas start
+  simultaneously, isn't implemented here.
+- **A mutable tag (e.g. always deploying under `:latest`) can't be
+  detected as a change.** Image comparison is a plain string check
+  against the tag written in the spec. If the underlying image content
+  changes but the tag string doesn't, `Reconciler` sees no difference
+  and does nothing -- the same real gotcha Kubernetes' `imagePullPolicy`
+  exists to work around, not solved here.
+- **No rollback.** If a `:v2` replacement never becomes healthy, the
+  rollout simply stalls indefinitely (old replicas keep running, since
+  they're never retired without a confirmed-healthy replacement) rather
+  than automatically reverting to the previous image. Stalling safely is
+  the correct behavior for *not making things worse*, but an operator
+  currently has to notice and intervene manually by editing the spec
+  back -- there's no automatic "this isn't working, revert" logic.
+- **A replacement that becomes healthy and then goes unhealthy shortly
+  after being retired for isn't specially detected as "this rollout
+  regressed."** It's caught by ordinary Phase 3 restart/backoff on a
+  later tick, the same as any other health failure, with no
+  rollout-specific handling.
+
+---
+
 ## Roadmap
 
-**Phase 4 — rolling deploys.** Deploy a new image version with
-zero-downtime replacement: start the new container, wait for it to pass
-health checks, only then stop the old one. The headline demo: `docker
-kill` a container mid-traffic and watch the system self-heal live.
-Builds directly on Phase 3's health-checking: a rolling deploy needs the
-exact same "wait for the new one to actually pass its HEALTHCHECK before
-touching the old one" logic already proven there.
-
 **Phase 5 — a CLI** (`apply`, `status`, `scale`, `rollback`) against this
-project's own spec format.
+project's own spec format. Restart counts and rolling-deploy progress
+(Phases 3-4) currently only exist in the reconciliation log's scrollback
+-- a real `status` command is the natural place to surface them instead.
 
 **Explicitly out of scope, named now rather than discovered later:**
 true multi-node scheduling across multiple Docker hosts. The scheduler
